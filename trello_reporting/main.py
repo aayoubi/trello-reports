@@ -4,24 +4,27 @@ from requests_oauthlib import OAuth1
 from requests_oauthlib import OAuth1Session
 from pprint import pprint
 import requests
+import logging
+import operator
 
 
+class Trello():
+    def __init__(self, auth):
+        self.auth = auth
 
-def trello_api_request(request, auth):
-    url = 'https://api.trello.com/%s' % request
-    r = requests.get(url, auth=auth)
-    print r.status_code
-    return r.json()
+    def get(self, request):
+        url = 'https://api.trello.com/%s' % request
+        r = requests.get(url, auth=self.auth)
+        return r.json()
 
+    def get_name_of_list(self, list_name):
+        return self.get('/1/lists/%s?fields=name' % list_name)['name']
 
-def get_trello_list_name(id, auth):
-    return trello_api_request('/1/lists/%s?fields=name' % id, auth)['name']
+    def get_name_of_label(self, label_name):
+        return self.get('/1/label/%s?fields=name' % label_name)['name']
 
-
-def get_aggregate_by_list(cards):
-    agg = defaultdict(list)
-    map(lambda card: agg[card['idList']].append(card), cards)
-    return agg
+    def get_name_of_member(self, member_name):
+        return self.get('/1/member/%s?fields=name' % member_name)['name']
 
 
 def get_oauth_token(client_api_key, client_api_secret, app_name, expiration='30days', scope='read'):
@@ -63,7 +66,7 @@ def get_oauth_token(client_api_key, client_api_secret, app_name, expiration='30d
     return access_token
 
 
-def get_oauth(client_api, client_secret, token, token_secret):
+def get_auth(client_api, client_secret, token, token_secret):
     oauth = OAuth1(client_key=client_api,
                    client_secret=client_secret,
                    resource_owner_key=token,
@@ -71,19 +74,50 @@ def get_oauth(client_api, client_secret, token, token_secret):
     return oauth
 
 
+def trello_add_card_creation_date(cards):
+    from trello_model import get_cet_timestamp_from_mongoid, get_datetime_from_utctimestamp, get_card_elapsed_time
+    map(lambda card: operator.setitem(card,
+                                      'timeDelta',
+                                      get_card_elapsed_time(get_cet_timestamp_from_mongoid(card['id']),
+                                                            get_datetime_from_utctimestamp(card['dateLastActivity']))),
+        cards)
+    return cards
+
+
+def aggregate_cards_by_list(cards, trello):
+    agg = defaultdict(list)
+    agg_with_labels = defaultdict(list)
+    map(lambda card: agg[card['idList']].append(card), cards)
+    for key in agg:
+        agg_with_labels[trello.get_name_of_list(key)] = agg[key] # INFO retrieve label of lists after aggregation
+    return agg_with_labels
+
+
 def main():
+    logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s %(message)s', level=logging.DEBUG)
+
+    # FIXME use argparse to switch between oauth token generation or other commands
     from secrets.api import TRELLO_API_KEY, TRELLO_API_SECRET, TOKEN, TOKEN_SECRET, APP_NAME
     from secrets.trello import BOARD_ID
 
     # access_token = get_oauth_token(TRELLO_API_KEY, TRELLO_API_SECRET, APP_NAME)
-    auth = get_oauth(TRELLO_API_KEY, TRELLO_API_SECRET, TOKEN, TOKEN_SECRET)
+    trello = Trello(get_auth(TRELLO_API_KEY, TRELLO_API_SECRET, TOKEN, TOKEN_SECRET))
 
-    fields = 'fields=name,id,idMembers,idLabels,idList,shortUrl'
-    cards = trello_api_request('/1/boards/%s/cards?limit=1000&%s' % (BOARD_ID, fields), auth)
-    agg = get_aggregate_by_list(cards)
+    fields = 'fields=name,id,idMembers,idLabels,idList,shortUrl,dateLastActivity'
+    cards = trello.get('/1/boards/%s/cards?limit=1000&%s' % (BOARD_ID, fields))
 
-    for k, v in agg.items():
-        print k, v
+    if len(cards) == 1000:
+        logging.warn("WARNING - retrieve 1000 cards, you may be missing other cards, considering Paging")
+        logging.warn("Check this: https://developers.trello.com/get-started/intro#paging")
+
+    logging.info("Processing [%d] cards" % len(cards))
+
+    cards = trello_add_card_creation_date(cards)
+    agg = aggregate_cards_by_list(cards, trello)
+
+    logging.info(dict(agg))
+    pprint(sorted(agg['In-progress'], key=lambda c: c['timeDelta']))
+
 
 if __name__ == '__main__':
     main()
