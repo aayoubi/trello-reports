@@ -20,26 +20,32 @@ class Action(object):
         self.desc = None
 
     def __str__(self):
-        return "{} - {} - {} - {} - {}".format(self.action_type, self.member_name, self.date, self.card_name, self.desc)
+        return "{} - {} - {} - {} - {}".format(self.action_type,
+                                               self.member_name, self.date,
+                                               self.card_name, self.desc)
 
 
 class ArchiveAction(Action):
     def __init__(self, action_data, *args):
         super(self.__class__, self).__init__(*args)
-        self.desc = 'Archived' if action_data['old']['closed'] == False else 'Unarchived'
+        self.desc = 'Archived' \
+            if action_data['old']['closed'] == False else 'Unarchived'
         self.archived = True if action_data['old']['closed'] == False else False
 
     @classmethod
     def describe_actions(cls, actions):
         print "# archived/unarchived"
-        print "- {} cards were archived this week".format(len([action for action in actions if action.archived]))
-        print "- {} cards were unarchived this week".format(len([action for action in actions if not action.archived]))
+        print "- {} cards were archived this week".format(
+            len([action for action in actions if action.archived]))
+        print "- {} cards were unarchived this week".format(
+            len([action for action in actions if not action.archived]))
 
 
 class MoveCardAction(Action):
     def __init__(self, action_data, *args):
         super(self.__class__, self).__init__(*args)
-        self.desc = 'Moved from {} to {}'.format(action_data['listBefore']['name'], action_data['listAfter']['name'])
+        self.desc = 'Moved from {} to {}'.format(
+            action_data['listBefore']['name'], action_data['listAfter']['name'])
 
     @classmethod
     def describe_actions(cls, actions):
@@ -55,23 +61,28 @@ class AddRemoveMember(Action):
         super(self.__class__, self).__init__(*args)
         self.member_name = board_members.get(action_data['idMember'])
         self.added = True if self.action_type == 'addMemberToCard' else False
-        self.desc = '{} member {}'.format('Added' if self.action_type == 'addMemberToCard' else 'Removed', action_data['idMember'])
+        self.desc = '{} member {}'.format(
+            'Added' if self.action_type == 'addMemberToCard' else 'Removed',
+            action_data['idMember'])
 
     @classmethod
     def describe_actions(cls, actions):
         print "# added members"
-        top_added_member = Counter([action.member_name for action in actions if action.added])
-        top_removed_member = Counter([action.member_name for action in actions if not action.added])
+        top_added = Counter([action.member_name
+                            for action in actions if action.added])
+        top_removed = Counter([action.member_name
+                               for action in actions if not action.added])
         print "- added to a card:"
-        for m in top_added_member.most_common(5):
+        for m in top_added.most_common(5):
             print "    - {} [{} times]".format(m[0], m[1])
         print "- removed from a card:"
-        for m in top_removed_member.most_common(5):
+        for m in top_removed.most_common(5):
             print "    - {} [{} times]".format(m[0], m[1])
 
 
 def transform_action(action):
-    common = (action['type'], action['memberCreator']['fullName'], action['date'], action['data']['card']['name'])
+    common = (action['type'], action['memberCreator']['fullName'],
+              action['date'], action['data']['card']['name'])
     if action['type'] == 'updateCard' and 'closed' in action['data']['old']:
         return ArchiveAction(action['data'], *common)
     elif action['type'] == 'updateCard' and 'listBefore' in action['data']:
@@ -111,7 +122,8 @@ def print_lists_to_csv(lists):
 
 
 def describe_last_week_actions(actions):
-    groups = groupby(sorted(actions, key=lambda a: a.__class__), lambda a: a.__class__)
+    groups = groupby(sorted(actions, key=lambda a: a.__class__),
+                     lambda a: a.__class__)
     for key, group in groups:
         key.describe_actions(list(group))
         print "---"
