@@ -1,122 +1,171 @@
-from collections import defaultdict
-
-from requests_oauthlib import OAuth1
-from requests_oauthlib import OAuth1Session
-from pprint import pprint
-import requests
+from collections import defaultdict, Counter
+from itertools import groupby
+from datetime import datetime, timedelta
+import argparse
 import logging
-import operator
+
+from delorean import Delorean
+from trello import TrelloApi
+
+# cache member id and full names
+board_members = {}
 
 
-class Trello():
-    def __init__(self, auth):
-        self.auth = auth
+class Action(object):
+    def __init__(self, action_type, member_name, date, card_name):
+        self.action_type = action_type
+        self.member_name = member_name
+        self.date = date
+        self.card_name = card_name
+        self.desc = None
 
-    def get(self, request):
-        url = 'https://api.trello.com/%s' % request
-        r = requests.get(url, auth=self.auth)
-        return r.json()
-
-    def get_name_of_list(self, list_name):
-        return self.get('/1/lists/%s?fields=name' % list_name)['name']
-
-    def get_name_of_label(self, label_name):
-        return self.get('/1/label/%s?fields=name' % label_name)['name']
-
-    def get_name_of_member(self, member_name):
-        return self.get('/1/member/%s?fields=name' % member_name)['name']
+    def __str__(self):
+        return "{} - {} - {} - {} - {}".format(self.action_type, self.member_name, self.date, self.card_name, self.desc)
 
 
-def get_oauth_token(client_api_key, client_api_secret, app_name, expiration='30days', scope='read'):
-    '''
-    Retrieves an access token from Trello using OAuth1
+class ArchiveAction(Action):
+    def __init__(self, action_data, *args):
+        super(self.__class__, self).__init__(*args)
+        self.desc = 'Archived' if action_data['old']['closed'] == False else 'Unarchived'
+        self.archived = True if action_data['old']['closed'] == False else False
 
-        client_api_key => the application key created at https://trello.com/app-key
-
-        client_api_secret => the secret key provided also at https://trello.com/app-key
-
-        app_name => the application name as it will appear in https://trello.com/me/account
-
-        expiration => string, expiration period of the access token, defaults to '30days'
-
-        scope => string, scope permissions of your token, default to 'read' (other possible value 'read,write')
-
-    :return: access_token
-    '''
-    request_token_url = 'https://trello.com/1/OAuthGetRequestToken'
-    authorize_url = 'https://trello.com/1/OAuthAuthorizeToken'
-    access_token_url = 'https://trello.com/1/OAuthGetAccessToken'
-
-    oauth = OAuth1Session(client_api_key, client_secret=client_api_secret)
-    fetch_response = oauth.fetch_request_token(request_token_url)
-    resource_owner_key = fetch_response.get('oauth_token')
-    resource_owner_secret = fetch_response.get('oauth_token_secret')
-    authorization_url = oauth.authorization_url(authorize_url + '?name=%s&expiration=%s&scope=%s' % (app_name, expiration, scope))
-
-    print('Please go here and authorize,', authorization_url)
-    oauth_verifier = raw_input('Paste the full verification code here: ')
-    session = OAuth1Session(client_api_key,
-                            client_secret=client_api_secret,
-                            resource_owner_key=resource_owner_key,
-                            resource_owner_secret=resource_owner_secret,
-                            verifier=oauth_verifier)
-    access_token = session.fetch_access_token(access_token_url)
-    print("Access token:")
-    pprint(access_token)
-    return access_token
+    @classmethod
+    def describe_actions(cls, actions):
+        print "# archived/unarchived"
+        print "- {} cards were archived this week".format(len([action for action in actions if action.archived]))
+        print "- {} cards were unarchived this week".format(len([action for action in actions if not action.archived]))
 
 
-def get_auth(client_api, client_secret, token, token_secret):
-    oauth = OAuth1(client_key=client_api,
-                   client_secret=client_secret,
-                   resource_owner_key=token,
-                   resource_owner_secret=token_secret)
-    return oauth
+class MoveCardAction(Action):
+    def __init__(self, action_data, *args):
+        super(self.__class__, self).__init__(*args)
+        self.desc = 'Moved from {} to {}'.format(action_data['listBefore']['name'], action_data['listAfter']['name'])
+
+    @classmethod
+    def describe_actions(cls, actions):
+        print "# moving cards"
+        top_moved = Counter([action.card_name for action in actions])
+        print "- Top 3 most moved cards around the board:"
+        for card in top_moved.most_common(3):
+            print "    - {} [{} times]".format(card[0], card[1])
+
+
+class AddRemoveMember(Action):
+    def __init__(self, action_data, *args):
+        super(self.__class__, self).__init__(*args)
+        self.member_name = board_members.get(action_data['idMember'])
+        self.added = True if self.action_type == 'addMemberToCard' else False
+        self.desc = '{} member {}'.format('Added' if self.action_type == 'addMemberToCard' else 'Removed', action_data['idMember'])
+
+    @classmethod
+    def describe_actions(cls, actions):
+        print "# added members"
+        top_added_member = Counter([action.member_name for action in actions if action.added])
+        top_removed_member = Counter([action.member_name for action in actions if not action.added])
+        print "- added to a card:"
+        for m in top_added_member.most_common(5):
+            print "    - {} [{} times]".format(m[0], m[1])
+        print "- removed from a card:"
+        for m in top_removed_member.most_common(5):
+            print "    - {} [{} times]".format(m[0], m[1])
+
+
+def transform_action(action):
+    common = (action['type'], action['memberCreator']['fullName'], action['date'], action['data']['card']['name'])
+    if action['type'] == 'updateCard' and 'closed' in action['data']['old']:
+        return ArchiveAction(action['data'], *common)
+    elif action['type'] == 'updateCard' and 'listBefore' in action['data']:
+        return MoveCardAction(action['data'], *common)
+    elif action['type'] in ('addMemberToCard', 'removeMemberFromCard'):
+        return AddRemoveMember(action['data'], *common)
+    else:
+        raise Exception('Unsupported action type found: {}'.format(action))
+
+
+def get_cet_timestamp_from_mongoid(object_id):
+    return datetime.utcfromtimestamp(int(object_id[0:8], 16))
 
 
 def trello_add_card_creation_date(cards):
-    from trello_model import get_cet_timestamp_from_mongoid, get_datetime_from_utctimestamp, get_card_elapsed_time
-    map(lambda card: operator.setitem(card,
-                                      'timeDelta',
-                                      get_card_elapsed_time(get_cet_timestamp_from_mongoid(card['id']),
-                                                            get_datetime_from_utctimestamp(card['dateLastActivity']))),
-        cards)
+    for card in cards:
+        creation_date = get_cet_timestamp_from_mongoid(card['id'])
+        card['timeDelta'] = (datetime.utcnow() - creation_date)
     return cards
 
 
-def aggregate_cards_by_list(cards, trello):
+def group_by_list(cards):
     agg = defaultdict(list)
-    agg_with_labels = defaultdict(list)
     map(lambda card: agg[card['idList']].append(card), cards)
-    for key in agg:
-        agg_with_labels[trello.get_name_of_list(key)] = agg[key] # INFO retrieve label of lists after aggregation
-    return agg_with_labels
+    return dict(agg)
+
+
+def replace_id_by_label(lists, trello):
+    return dict((trello.lists.get(key)['name'], value)
+                for key, value in lists.items())
+
+
+def print_lists_to_csv(lists):
+    for list_name, cards in lists.items():
+        for card in cards:
+            print list_name, card['name'], card['timeDelta'], card['idMembers']
+
+
+def describe_last_week_actions(actions):
+    groups = groupby(sorted(actions, key=lambda a: a.__class__), lambda a: a.__class__)
+    for key, group in groups:
+        key.describe_actions(list(group))
+        print "---"
 
 
 def main():
-    logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s %(message)s', level=logging.DEBUG)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-c", "--client-api-key",
+                        help="your app's client api key",
+                        action="store", required=True)
+    parser.add_argument("-t", "--token", help="your app's access token",
+                        action="store", required=True)
+    parser.add_argument("-b", "--board-id", help="your trello board id",
+                        action="store", required=True)
+    args = vars(parser.parse_args())
 
-    # FIXME use argparse to switch between oauth token generation or other commands
-    from secrets.api import TRELLO_API_KEY, TRELLO_API_SECRET, TOKEN, TOKEN_SECRET, APP_NAME
-    from secrets.trello import BOARD_ID
+    log_format = '%(asctime)s - %(name)s - %(levelname)s %(message)s'
+    logging.basicConfig(format=log_format, level=logging.WARN)
 
-    # access_token = get_oauth_token(TRELLO_API_KEY, TRELLO_API_SECRET, APP_NAME)
-    trello = Trello(get_auth(TRELLO_API_KEY, TRELLO_API_SECRET, TOKEN, TOKEN_SECRET))
+    trello = TrelloApi(args['client_api_key'])
+    trello.set_token(args['token'])
 
-    fields = 'fields=name,id,idMembers,idLabels,idList,shortUrl,dateLastActivity'
-    cards = trello.get('/1/boards/%s/cards?limit=1000&%s' % (BOARD_ID, fields))
-
-    if len(cards) == 1000:
-        logging.warn("WARNING - retrieve 1000 cards, you may be missing other cards, considering Paging")
-        logging.warn("Check this: https://developers.trello.com/get-started/intro#paging")
-
-    logging.info("Processing [%d] cards" % len(cards))
-
+    fields = 'fields=id,idMembers,idLabels,idList,shortUrl,dateLastActivity,\
+name'
+    cards = trello.boards.get_card(args['board_id'], fields=fields)
     cards = trello_add_card_creation_date(cards)
-    agg = aggregate_cards_by_list(cards, trello)
+    cards.sort(key=lambda c: c['timeDelta'])
+    lists = group_by_list(cards)
+    lists = replace_id_by_label(lists, trello)
 
-    logging.info(dict(agg))
-    pprint(sorted(agg['In-progress'], key=lambda c: c['timeDelta']))
+    members = trello.boards.get('{}/members'.format(args['board_id']))
+    for member in members:
+        board_members[member['id']] = member['fullName']
+
+    last_week = Delorean() - timedelta(weeks=1)
+    print("Since {} - {}".format(last_week.humanize(), last_week.date))
+
+    action_filter = 'filter=createCard,deleteCard,updateCard:closed,\
+addMemberToCard,removeMemberFromCard,updateCard:idList'
+    actions = trello.boards.get('{}/actions?limit=1000&filter={}&since={}'
+                                .format(args['board_id'],
+                                        action_filter,
+                                        last_week.date))
+    # TODO add paging support if we go over 1000
+    if len(actions) == 1000:
+        logging.warn('the number of retried actions is over 1000, you may \
+be missing other actions that occurred during the last week, \
+please support paging')
+
+    simple_actions = map(lambda a: transform_action(a), actions)
+    describe_last_week_actions(simple_actions)
+    print "---"
+    for action in simple_actions:
+        print action
 
 
 if __name__ == '__main__':
